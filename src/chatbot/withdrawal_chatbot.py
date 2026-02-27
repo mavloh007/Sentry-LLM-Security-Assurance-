@@ -14,10 +14,9 @@ from dotenv import load_dotenv
 import sys
 
 from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_core.tools import tool
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vector_store.vector_store import VectorStore
@@ -358,17 +357,7 @@ class WithdrawalChatbot:
             create_support_ticket,
             search_policy_faq,
         ]
-        
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", self.system_prompt),
-            ("system", "Official SGBank Withdrawal Policy Excerpts:\n\n{context}"),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("user", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
-        
-        self.agent = create_openai_tools_agent(self.llm, self.tools, self.prompt)
-        self.agent_executor = AgentExecutor(agent=self.agent, tools=self.tools, verbose=False)
+        self.agent_executor = create_react_agent(self.llm, self.tools)
 
     def clear_history(self):
         self.conversation_history = []
@@ -428,13 +417,17 @@ class WithdrawalChatbot:
 
         try:
             # Run the LangChain agent
-            response = self.agent_executor.invoke({
-                "input": user_message,
-                "context": context,
-                "chat_history": self.conversation_history[-5:] # Keep last 5 turns
-            })
+            system_content = self.system_prompt
+            if context:
+                system_content += f"\n\nOfficial SGBank Withdrawal Policy Excerpts:\n\n{context}"
 
-            answer = response["output"]
+            messages = [
+                SystemMessage(content=system_content),
+                *self.conversation_history[-5:],
+                HumanMessage(content=user_message),
+            ]
+            response = self.agent_executor.invoke({"messages": messages})
+            answer = response["messages"][-1].content
             
             # Update history with LangChain message objects
             self.conversation_history.append(HumanMessage(content=user_message))
