@@ -12,14 +12,16 @@ from typing import List, Dict, Optional
 from openai import OpenAI
 from dotenv import load_dotenv
 import sys
+from uuid import uuid4, uuid5, NAMESPACE_DNS
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain.agents import create_agent
+from sentence_transformers import SentenceTransformer
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from vector_store.vector_store import VectorStore
+from db.supabase_client import SupabaseDB, SupabaseVectorStore
 from .sentinel_guard import SentinelGuard
 
 OLD_SYS_PROMPT = """
@@ -124,30 +126,46 @@ def make_doc_system_prompt(doc_id: str) -> str:
 # -----------------------------
 # RAG tool factory (doc-scoped)
 # -----------------------------
-def make_doc_rag_tool(vector_store, doc_id: str, k: int = 3):
+def make_doc_rag_tool(db, embedder, doc_id: str, k: int = 3):
     @tool(f"rag_{doc_id}")
     def rag_tool(query: str) -> str:
         """Search ONLY the approved document and return relevant excerpts."""
-        # Preferred path: metadata filter support
         try:
-            results = vector_store.search(query, n_results=k, filter={"doc_id": doc_id})
-        except TypeError:
-            # Fallback if your VectorStore.search doesn't support filter:
-            results = vector_store.search(query, n_results=max(k * 3, 8))
-
-        docs = (results or {}).get("documents", [[]])[0] or []
-
-        # Fallback filter if needed (because you embed [DOC_ID: ...] in text)
-        if docs and all(("filter" not in getattr(vector_store.search, "__code__", {}).co_varnames) for _ in [0]):
-            tagged = [d for d in docs if f"[DOC_ID: {doc_id}]" in d]
-            if tagged:
-                docs = tagged
-
-        if not docs:
-            return "No relevant excerpts found in the approved document."
-
-        return "\n\n".join(docs[:k])
-
+            query_embedding = embedder.encode(query).tolist()
+            results = db.search_documents(embedding=query_embedding, limit=k*2, threshold=0.5)  # Get more to debug
+            
+            # Debug output
+            print(f"\n{'='*60}")
+            print(f"[RAG TOOL DEBUG] for doc_id: {doc_id}")
+            print(f"[RAG TOOL DEBUG] Query: '{query}'")
+            print(f"[RAG TOOL DEBUG] Total results from search: {len(results)}")
+            
+            # Show all unique sources in results
+            sources_found = set()
+            for r in results:
+                src = r.get('source')
+                if src not in sources_found:
+                    print(f"  → Found source: '{src}'")
+                    sources_found.add(src)
+            
+            # Filter by exact source match
+            docs = [r['content'] for r in results if r.get('source') == doc_id]
+            print(f"[RAG TOOL DEBUG] After filtering for '{doc_id}': {len(docs)} docs")
+            print(f"{'='*60}\n")
+            
+            if not docs:
+                # If no exact match, show what sources ARE available
+                if sources_found:
+                    return f"⚠️ No documents found for '{doc_id}'. Available sources: {', '.join(sorted(sources_found))}"
+                else:
+                    return "No relevant documents found in the approved document."
+            
+            return "\n\n".join(docs[:k])
+        except Exception as e:
+            print(f"Error in RAG tool: {e}")
+            import traceback
+            traceback.print_exc()
+            return "Error retrieving documents."
     return rag_tool
 
 
@@ -155,8 +173,8 @@ def make_doc_rag_tool(vector_store, doc_id: str, k: int = 3):
 # Agent builder (one agent per doc_id)
 # -------------------------------------
 # , extra_tools=None
-def build_doc_agent(llm, vector_store, doc_id: str, k: int = 3):
-    rag_tool = make_doc_rag_tool(vector_store, doc_id, k=k)
+def build_doc_agent(llm, db, embedder, doc_id: str, k: int = 3):
+    rag_tool = make_doc_rag_tool(db, embedder, doc_id, k=k)
 
     tools = [rag_tool]
     # if extra_tools:
@@ -177,31 +195,12 @@ def build_doc_agent(llm, vector_store, doc_id: str, k: int = 3):
 # ----------------------------------------------------
 # Build all 4 agents for your ingested doc_id set
 # ----------------------------------------------------
-def build_all_policy_agents(llm, vector_store):
-    # Choose tools per agent.
-    # Recommendation: do NOT give sensitive tools (account lookup, eligibility checker)
-    # to docs that don't need them. Keep tool surface minimal.
+def build_all_policy_agents(llm, db, embedder):
     agents = {
-        "withdrawal": build_doc_agent(
-            llm, vector_store, POLICY_DOC_IDS["withdrawal"],
-            # extra_tools=[find_nearest_branch, create_support_ticket, search_policy_faq],
-            k=3,
-        ),
-        "emergency": build_doc_agent(
-            llm, vector_store, POLICY_DOC_IDS["emergency"],
-            # extra_tools=[find_nearest_branch, create_support_ticket, search_policy_faq],
-            k=3,
-        ),
-        "identity": build_doc_agent(
-            llm, vector_store, POLICY_DOC_IDS["identity"],
-            # extra_tools=[create_support_ticket, search_policy_faq],
-            k=3,
-        ),
-        "fraud": build_doc_agent(
-            llm, vector_store, POLICY_DOC_IDS["fraud"],
-            # extra_tools=[create_support_ticket, search_policy_faq],
-            k=3,
-        ),
+        "withdrawal": build_doc_agent(llm, db, embedder, POLICY_DOC_IDS["withdrawal"], k=3),
+        "emergency": build_doc_agent(llm, db, embedder, POLICY_DOC_IDS["emergency"], k=3),
+        "identity": build_doc_agent(llm, db, embedder, POLICY_DOC_IDS["identity"], k=3),
+        "fraud": build_doc_agent(llm, db, embedder, POLICY_DOC_IDS["fraud"], k=3),
     }
     return agents
 
@@ -215,7 +214,9 @@ class WithdrawalChatbot:
         model: str = "gpt-4o-mini",
         temperature: float = 0.1,
         max_tokens: int = 400,
-        vector_store: Optional[VectorStore] = None,
+        user_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        db: Optional[SupabaseDB] = None,
     ):
         load_dotenv()
 
@@ -235,18 +236,62 @@ class WithdrawalChatbot:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
-
-        self.vector_store = vector_store
-        if not self.vector_store:
-            raise ValueError("Vector store not provided. Pass vector_store=VectorStore(...).")
+        
+        # Supabase database
+        self.db = db or SupabaseDB()
+        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        # Use fixed UUID for local test user (consistent across runs)
+        self.user_id = str(uuid5(NAMESPACE_DNS, "local-test-user"))
+        self.conversation_id = conversation_id
+        
+        # Ensure test user exists in database
+        if not self.db.get_user(self.user_id):
+            self.db.create_user(
+                user_id=self.user_id,
+                email="local@test.local",
+                metadata={"type": "local_chatbot"}
+            )
+        
+        # Create conversation if not provided
+        if not self.conversation_id:
+            conv = self.db.create_conversation(
+                user_id=self.user_id,
+                title="Withdrawal Bot Session"
+            )
+            self.conversation_id = conv['id']
 
         self.sentinel_guard = SentinelGuard()
 
         # Build doc-scoped policy agents (callables returned by build_doc_agent)
-        self.policy_agents = build_all_policy_agents(self.llm, self.vector_store)
+        self.policy_agents = build_all_policy_agents(self.llm, self.db, self.embedder)
 
-        # Unified history (optional). Note: if you want per-agent histories, store per-key instead.
+        # Conversation history (kept in memory for agent context, also stored in Supabase)
         self.conversation_history: List = []
+        
+        # Debug: Check what documents exist in the database
+        self._debug_database_contents()
+
+    def _debug_database_contents(self):
+        """Debug function to show what's in the database"""
+        try:
+            # Try to get raw documents from database
+            all_docs = self.db.get_all_documents()
+            print(f"\n[DEBUG] Total documents in database: {len(all_docs) if all_docs else 0}")
+            if all_docs:
+                sources_in_db = {}
+                for doc in all_docs[:10]:  # Show first 10
+                    src = doc.get('source', 'UNKNOWN')
+                    if src not in sources_in_db:
+                        sources_in_db[src] = 0
+                    sources_in_db[src] += 1
+                print(f"[DEBUG] Document sources in database:")
+                for src, count in sources_in_db.items():
+                    print(f"  → {src}: {count} documents")
+                if len(all_docs) > 10:
+                    print(f"  ... and {len(all_docs) - 10} more")
+        except Exception as e:
+            print(f"[DEBUG] Could not query database: {e}")
 
     def clear_history(self):
         self.conversation_history = []
@@ -360,24 +405,79 @@ class WithdrawalChatbot:
     # Main Chat Method
     # ---------------------------
     def chat(self, user_message: str, debug: bool = False) -> str:
-        #if self._should_reject(user_message):
-            #return "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
-
+        """Chat with the withdrawal assistant and store in Supabase"""
+        # Route to appropriate agent
         agent_key = self._route(user_message)
 
-        if self._check_sentinel_input(agent_key, user_message):
-            return "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
-
-        runner = self.policy_agents.get(agent_key)
-        if not runner:
-            return "System error: No agent available for this request."
         try:
+            # Store user message in Supabase first (before validation)
+            msg_response = self.db.add_message(
+                conversation_id=self.conversation_id,
+                user_id=self.user_id,
+                role="user",
+                content=user_message,
+                metadata={"routed_to": agent_key}
+            )
+            message_id = msg_response.get('id') if isinstance(msg_response, dict) else str(uuid4())
+            
+            # Log audit for message received
+            self.db.create_audit_log(
+                user_id=self.user_id,
+                action="message_received",
+                resource="conversation",
+                details={"conversation_id": self.conversation_id, "agent": agent_key}
+            )
+
+            # Check input safety
+            if self._check_sentinel_input(agent_key, user_message):
+                blocked_response = "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
+                
+                # Flag the stored message
+                self.db.flag_message_as_suspicious(
+                    message_id=message_id,
+                    reason="sentinel_input_blocked",
+                    details={"user_message": user_message[:100], "agent_key": agent_key}
+                )
+                return blocked_response
+
+            # Get agent
+            runner = self.policy_agents.get(agent_key)
+            if not runner:
+                return "System error: No agent available for this request."
+            
+            # Generate response
             answer = runner(user_message, history=self.conversation_history[-5:])
 
+            # Check output safety
             if self._check_sentinel_output(agent_key, user_message, answer):
-                return "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
+                blocked_response = "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
+                
+                # Flag the stored user message
+                self.db.flag_message_as_suspicious(
+                    message_id=message_id,
+                    reason="sentinel_output_blocked",
+                    details={"generated_response": answer[:100]}
+                )
+                return blocked_response
 
-            # Update shared history
+            # Store assistant response in Supabase
+            self.db.add_message(
+                conversation_id=self.conversation_id,
+                user_id=self.user_id,
+                role="assistant",
+                content=answer,
+                metadata={"agent": agent_key}
+            )
+            
+            # Log successful response
+            self.db.create_audit_log(
+                user_id=self.user_id,
+                action="response_generated",
+                resource="conversation",
+                details={"conversation_id": self.conversation_id, "response_length": len(answer)}
+            )
+
+            # Update shared history for context
             self.conversation_history.append(HumanMessage(content=user_message))
             self.conversation_history.append(AIMessage(content=answer))
 
@@ -386,4 +486,15 @@ class WithdrawalChatbot:
             return answer
 
         except Exception as e:
-            return f"System error: {str(e)}"
+            error_msg = f"System error: {str(e)}"
+            
+            # Log error
+            self.db.create_audit_log(
+                user_id=self.user_id,
+                action="chat_error",
+                resource="conversation",
+                details={"error": str(e)},
+                status="failed"
+            )
+            
+            return error_msg

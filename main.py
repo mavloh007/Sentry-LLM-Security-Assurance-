@@ -1,20 +1,24 @@
 from src.chatbot.withdrawal_chatbot import WithdrawalChatbot
-from src.vector_store.vector_store import VectorStore
+from src.db.supabase_client import SupabaseDB
 from dotenv import load_dotenv
 import os
 
 def main():
     load_dotenv()
 
-    # Initialize vector store (must match ingest path + collection)
-    vs = VectorStore(
-        persist_directory="./vectordb",
-        collection_name="sgbank_withdrawal_policy"
-    )
+    # Initialize Supabase database
+    db = SupabaseDB()
+    
+    # Verify connection
+    health = db.health_check()
+    if not health:
+        print("Error: Could not connect to Supabase database")
+        return
+    
+    print("Connected to Supabase database.")
 
-    print(f"Documents in collection: {vs.get_collection_count()}")
-
-    bot = WithdrawalChatbot(vector_store=vs)
+    # Initialize chatbot (auto-creates user_id and conversation)
+    bot = WithdrawalChatbot(db=db)
 
     print("\nSGBank Withdrawal Assistant Ready.")
     print("Type 'exit' to quit.\n")

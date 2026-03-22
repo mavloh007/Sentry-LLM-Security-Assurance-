@@ -8,20 +8,27 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.chatbot.withdrawal_chatbot import WithdrawalChatbot
-from src.vector_store.vector_store import VectorStore
+from src.db.supabase_client import SupabaseDB
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# Initialize vector store once when starting the app
-vs = VectorStore(
-    persist_directory="../vectordb",
-    collection_name="sgbank_withdrawal_policy"
-)
-print(f"DEBUG: Initialized VectorStore at ../vectordb. Collection count: {vs.get_collection_count()}")
-bot = WithdrawalChatbot(vector_store=vs)
+# Initialize Supabase database connection
+try:
+    db = SupabaseDB()
+    if not db.health_check():
+        print("ERROR: Could not connect to Supabase database")
+        raise Exception("Supabase connection failed")
+    print("✓ Connected to Supabase database")
+except Exception as e:
+    print(f"ERROR initializing database: {e}")
+    raise
+
+# Initialize chatbot with Supabase backend
+bot = WithdrawalChatbot(db=db)
+print("✓ Withdrawal Chatbot initialized with Supabase backend")
 
 @app.route('/')
 def index():

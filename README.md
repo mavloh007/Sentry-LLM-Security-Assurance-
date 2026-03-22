@@ -5,7 +5,7 @@ A chatbot framework with vector database storage and prompt attack testing capab
 ## Features
 
 - **Chatbot**: Conversational AI with RAG (Retrieval-Augmented Generation) capabilities
-- **Vector Store**: Efficient document storage and similarity search using ChromaDB
+- **Vector Store**: Efficient document storage and similarity search using Supabase pgvector (384-dim embeddings)
 - **Prompt Attack Dataset**: Security testing dataset with 15+ prompt injection patterns
 - **Frontend Skeleton**: A basic UI for interacting with the chatbot (placeholder mode).
 
