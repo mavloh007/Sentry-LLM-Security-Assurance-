@@ -9,9 +9,11 @@ if project_root not in sys.path:
 
 from src.chatbot.withdrawal_chatbot import WithdrawalChatbot
 from src.db.supabase_client import SupabaseDB
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 load_dotenv()
+dotenv_path = find_dotenv(".env", usecwd=True)
+load_dotenv(dotenv_path, override=True)
 
 app = Flask(__name__)
 
