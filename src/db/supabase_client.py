@@ -141,6 +141,33 @@ class SupabaseDB:
             print(f"Error listing conversations: {e}")
             return []
 
+    # Backwards-compatible alias (app.py currently calls this)
+    def get_user_conversations(self, user_id: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+        return self.list_user_conversations(user_id=user_id, limit=limit, offset=offset)
+
+    def update_conversation_metadata(self, conversation_id: str, metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Merge/update conversation metadata.
+
+        Best-effort: reads existing metadata and merges keys, then updates.
+        """
+        try:
+            existing = self.get_conversation(conversation_id)
+            merged = {}
+            if isinstance(existing, dict) and isinstance(existing.get("metadata"), dict):
+                merged.update(existing["metadata"])
+            merged.update(metadata or {})
+
+            response = (
+                self.client.table("conversations")
+                .update({"metadata": merged, "updated_at": datetime.utcnow().isoformat()})
+                .eq("id", conversation_id)
+                .execute()
+            )
+            return response.data[0] if response.data else None
+        except postgrest_exceptions.APIError as e:
+            print(f"Error updating conversation metadata: {e}")
+            return None
+
     # ==================== MESSAGE MANAGEMENT ====================
 
     def add_message(
@@ -185,6 +212,35 @@ class SupabaseDB:
         except postgrest_exceptions.APIError as e:
             print(f"Error fetching conversation history: {e}")
             return []
+
+    # ==================== ACCOUNT SNAPSHOT (SIMPLE) ====================
+
+    def get_user_account_snapshot(self, user_id: str) -> Dict[str, Any]:
+        """Return simple account fields for demo tools.
+
+        Supports both schemas:
+        - `users.metadata` JSON object containing these fields
+        - top-level columns on the `users` table (e.g., balance, daily_limit)
+        """
+
+        user = self.get_user(user_id)
+
+        metadata: Dict[str, Any] = {}
+        if isinstance(user, dict) and isinstance(user.get("metadata"), dict):
+            metadata = user["metadata"]
+
+        def pick(key: str, default: Any = None) -> Any:
+            if metadata.get(key) is not None:
+                return metadata.get(key)
+            if isinstance(user, dict) and user.get(key) is not None:
+                return user.get(key)
+            return default
+
+        return {
+            "user_id": user_id,
+            "balance": pick("balance"),
+            "daily_limit": pick("daily_limit")
+        }
 
     # ==================== DOCUMENT & VECTOR MANAGEMENT ====================
 

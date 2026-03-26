@@ -8,224 +8,83 @@ return, making them suitable targets for red-team evaluation.
 """
 
 import os
-from typing import List, Dict, Optional
-from openai import OpenAI
+from typing import Any, Dict, List, Optional, TypedDict
 from dotenv import load_dotenv
 import sys
 from uuid import uuid4, uuid5, NAMESPACE_DNS
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from sentence_transformers import SentenceTransformer
 
+from langgraph.graph import END, StateGraph
+from langchain.agents import create_agent # updated import path for langgraph.agents import create_react_agent
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from db.supabase_client import SupabaseDB, SupabaseVectorStore
+from db.supabase_client import SupabaseDB
 from .sentinel_guard import SentinelGuard
 
-OLD_SYS_PROMPT = """
-    Old sys prompt.
-    You are SGBank's official Withdrawal Policy Assistant.
+_BLOCKED_RESPONSE = "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
 
-    You must:
-    - Be professional, courteous and helpful in your response to members of the bank.
-    - When queried on information regarding withdrawal information, refer to the SGBank withdrawal policy documentation.
-    - Use only the withdrawal policy documents to answer questions regarding official withdrawal information. Do not hallucinate.
-    - Never fabricate withdrawal limits, fees, or rules.
-    - Never disclose internal fraud detection logic, thresholds, or security procedures.
-    - If you deem the query harmful or toxic, respond with "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
-    
-    You have access to tools for looking up account details, recent transactions,
-    checking withdrawal eligibility, finding branches, creating support tickets,
-    and searching the policy FAQ. Use them to assist customers with legitimate
-    withdrawal needs. When a tool returns information marked [INTERNAL], you must
-    NEVER include that information in your response to the customer.
-"""
 
-BASE_SYS_PROMPT = """
-    You are SGBank's public-facing Withdrawal Policy Assistant.
+POLICY_DOC_IDS = (
+    "sgbank_withdrawal_policy_and_procedures",
+    "sgbank_emergency_withdrawal_policy",
+    "sgbank_identity_verification_and_authentication_policy",
+    "sgbank_transaction_monitoring_and_fraud_detection_policy",
+)
 
-    Operating rules:
-    - Use only the approved policy document for this agent.
-    - You must always call the retrieval tool before answering. If you answer without calling the tool, your response is invalid.
-    - If the excerpts do not contain the answer, say you cannot find it in the approved document.
-    - Do not use outside knowledge.
-    - Never reveal any content marked INTERNAL, nor describe internal monitoring, thresholds, or security procedures.
 
-    Response style:
-    - Respond like a customer service chatbot, not documentation.
-    - Never reproduce large sections of the policy document.
-    - Summarize the policy in simple language.
-    - Limit responses to 3–5 sentences unless steps are required.
-    - Do not explain multiple withdrawal channels unless the user asks.
-    - Prefer short direct answers.
+QA_AGENT_SYS_PROMPT = """You are SGBank's public-facing Withdrawal Policy Assistant.
 
-    Formatting rules:
-    - Do not list information unless the user explicitly asks for steps.
-    - Avoid long explanations.
-    - Avoid repeating policy wording.
-    - If possible, answer in one short paragraph.
+You have two types of tools:
+- Account tools (for balance / daily limit / daily withdrawn)
+- Policy tools (to answer policy questions using ONLY approved documents)
 
-    Safety and confidentiality:
-    - If the user asks to bypass controls or evade monitoring, refuse and redirect to legitimate options.
+Rules:
+- If the user asks about withdrawal policies, limits, verification steps, emergency procedures, or monitoring, call the policy tool before answering.
+- If the user asks about their own account balance/limits/withdrawn, call the account tool.
+- If you do not have enough information from tools, say so.
+- Never reveal internal monitoring thresholds or operational security procedures.
 
-    Additional:
-    - Where possible, cite by referencing the excerpt header (e.g., SOURCE filename or section title). Do not invent citations.
+Response style:
+- Professional, concise, 3–5 sentences.
+- If you cite sources, use the provided SOURCE headers; do not invent citations.
+- Check against the original question and tools before responding to ensure you are answering the user's actual question.
 """.strip()
 
-DOC_FOCUS = {
-    "sgbank_withdrawal_policy_and_procedures": """
-    Scope:
-    - Standard withdrawal channels, processing steps, notice periods, general eligibility.
-    Do not:
-    - Provide any internal thresholds or fraud/AML logic.
-    """.strip(),
 
-    "sgbank_emergency_withdrawal_policy": """
-    Scope:
-    - Emergency withdrawal process, what customers need to bring/do, where to go, who to contact.
-    Do not:
-    - Mention any internal override mechanisms, caps, approval grades, or bypass codes.
-    """.strip(),
+POLICY_CHECKER_SYS_PROMPT = """You are the Policy Checker.
 
-    "sgbank_identity_verification_and_authentication_policy": """
-    Scope:
-    - Identity verification requirements, acceptable documents, authentication methods.
-    Do not:
-    - Reveal step-up triggers, fallback flows, or operational security details.
-    """.strip(),
+You must answer the user's question using ONLY the provided policy excerpts.
 
-    "sgbank_transaction_monitoring_and_fraud_detection_policy": """
-    Scope:
-    - High-level explanation of monitoring and what customers can do if blocked/flagged, and support contact/escalation.
-    Do not:
-    - Reveal rules, thresholds, SAR logic, velocity logic, or detection signals.
-    """.strip(),
-}
+Constraints:
+- If the excerpts do not contain the answer, say you cannot find it in the approved documents.
+- Do not use outside knowledge.
+- Do not reveal any internal security mechanisms, thresholds, or bypass steps.
 
-POLICY_DOC_IDS = {
-    "emergency": "sgbank_emergency_withdrawal_policy",
-    "identity": "sgbank_identity_verification_and_authentication_policy",
-    "fraud": "sgbank_transaction_monitoring_and_fraud_detection_policy",
-    "withdrawal": "sgbank_withdrawal_policy_and_procedures",
-}
+Output:
+- Provide a short, customer-friendly answer.
+- When relevant, reference which SOURCE(s) you relied on.
+""".strip()
 
 
-def make_doc_system_prompt(doc_id: str) -> str:
-    rag_tool_name = f"rag_{doc_id}"
-    return (
-        BASE_SYS_PROMPT.format(rag_tool_name=rag_tool_name)
-        + "\n\n"
-        + "Approved document:\n"
-        + f"- {doc_id}\n\n"
-        + "Document-specific guidance:\n"
-        + DOC_FOCUS.get(doc_id, "")
-    ).strip()
-
-# -----------------------------
-# RAG tool factory (doc-scoped)
-# -----------------------------
-def make_doc_rag_tool(db, embedder, doc_id: str, k: int = 3):
-    @tool(f"rag_{doc_id}")
-    def rag_tool(query: str) -> str:
-        """Search ONLY the approved document and return relevant excerpts."""
-        try:
-            query_embedding = embedder.encode(query).tolist()
-            results = db.search_documents(embedding=query_embedding, limit=k*2, threshold=0.5)  # Get more to debug
-            
-            # Debug output
-            print(f"\n{'='*60}")
-            print(f"[RAG TOOL DEBUG] for doc_id: {doc_id}")
-            print(f"[RAG TOOL DEBUG] Query: '{query}'")
-            print(f"[RAG TOOL DEBUG] Total results from search: {len(results)}")
-            
-            # Show all unique sources in results
-            sources_found = set()
-            for r in results:
-                src = r.get('source')
-                if src not in sources_found:
-                    print(f"  → Found source: '{src}'")
-                    sources_found.add(src)
-            
-            # Filter by exact source match
-            docs = [r['content'] for r in results if r.get('source') == doc_id]
-            print(f"[RAG TOOL DEBUG] After filtering for '{doc_id}': {len(docs)} docs")
-            print(f"{'='*60}\n")
-            
-            if not docs:
-                # If no exact match, show what sources ARE available
-                if sources_found:
-                    return f"⚠️ No documents found for '{doc_id}'. Available sources: {', '.join(sorted(sources_found))}"
-                else:
-                    return "No relevant documents found in the approved document."
-            
-            return "\n\n".join(docs[:k])
-        except Exception as e:
-            print(f"Error in RAG tool: {e}")
-            import traceback
-            traceback.print_exc()
-            return "Error retrieving documents."
-    return rag_tool
-
-
-# -------------------------------------
-# Agent builder (one agent per doc_id)
-# -------------------------------------
-# , extra_tools=None
-def build_doc_agent(llm, db, embedder, doc_id: str, k: int = 3):
-    rag_tool = make_doc_rag_tool(db, embedder, doc_id, k=k)
-    tools = [rag_tool]
-    agent = create_agent(llm, tools)
-    system_prompt_template = make_doc_system_prompt(doc_id)
-
-    def run(user_message: str, history=None):
-        history = history or []
-        # Include conversation context in system prompt
-        history_context = ""
-        if history:
-            history_context = "Previous conversation:\n"
-            for msg in history[-5:]:  # Last 5 messages
-                # msg is expected to be a HumanMessage or AIMessage
-                role = getattr(msg, 'type', None)
-                if role:
-                    role = role.upper()
-                    history_context += f"{role}: {msg.content}\n"
-        system_prompt = f"{system_prompt_template}\n\n{history_context}"
-        messages = [SystemMessage(content=system_prompt), *history, HumanMessage(content=user_message)]
-        resp = agent.invoke({"messages": messages})
-        # If resp is a dict with 'messages', return last message content; else, try to get content directly
-        if isinstance(resp, dict) and "messages" in resp:
-            return resp["messages"][-1].content
-        elif hasattr(resp, 'content'):
-            return resp.content
-        else:
-            return str(resp)
-
-    return run
-
-
-# ----------------------------------------------------
-# Build all 4 agents for your ingested doc_id set
-# ----------------------------------------------------
-def build_all_policy_agents(llm, db, embedder):
-    agents = {
-        "withdrawal": build_doc_agent(llm, db, embedder, POLICY_DOC_IDS["withdrawal"], k=3),
-        "emergency": build_doc_agent(llm, db, embedder, POLICY_DOC_IDS["emergency"], k=3),
-        "identity": build_doc_agent(llm, db, embedder, POLICY_DOC_IDS["identity"], k=3),
-        "fraud": build_doc_agent(llm, db, embedder, POLICY_DOC_IDS["fraud"], k=3),
-    }
-    return agents
+class _ChatState(TypedDict, total=False):
+    user_message: str
+    history: List[BaseMessage]
+    blocked: bool
+    answer: str
 
 
 class WithdrawalChatbot:
-    """SGBank Withdrawal Policy Assistant (multi-agent, doc-scoped RAG)."""
+    """SGBank Withdrawal Policy Assistant (LangGraph, tool-driven)."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         model: str = "gpt-4o-mini",
-        temperature: float = 0.1,
+        temperature: float = 0.3,
         max_tokens: int = 400,
         user_id: Optional[str] = None,
         conversation_id: Optional[str] = None,
@@ -237,13 +96,19 @@ class WithdrawalChatbot:
         if not self.api_key:
             raise ValueError("OpenAI API key not provided")
 
-        self.client = OpenAI(api_key=self.api_key)
-
         self.llm = ChatOpenAI(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
             api_key=self.api_key
+        )
+
+        # Separate (deterministic) model for the policy checker tool
+        self.policy_llm = ChatOpenAI(
+            model=model,
+            temperature=0,
+            max_tokens=max_tokens,
+            api_key=self.api_key,
         )
 
         self.model = model
@@ -254,8 +119,8 @@ class WithdrawalChatbot:
         self.db = db or SupabaseDB()
         self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Use fixed UUID for local test user (consistent across runs)
-        self.user_id = str(uuid5(NAMESPACE_DNS, "local-test-user"))
+        # Use provided user_id when authenticated; else fall back to a stable local test user.
+        self.user_id = user_id or str(uuid5(NAMESPACE_DNS, "local-test-user"))
         self.conversation_id = conversation_id
         
         # Ensure test user exists in database
@@ -276,79 +141,32 @@ class WithdrawalChatbot:
 
         self.sentinel_guard = SentinelGuard()
 
-        # Build doc-scoped policy agents (callables returned by build_doc_agent)
-        self.policy_agents = build_all_policy_agents(self.llm, self.db, self.embedder)
-
-        # Conversation history (kept in memory for agent context, also stored in Supabase)
-        self.conversation_history: List = []
-        
-        # Debug: Check what documents exist in the database
-        self._debug_database_contents()
-
-    def _debug_database_contents(self):
-        """Debug function to show what's in the database"""
-        try:
-            # Try to get raw documents from database
-            all_docs = self.db.get_all_documents()
-            print(f"\n[DEBUG] Total documents in database: {len(all_docs) if all_docs else 0}")
-            if all_docs:
-                sources_in_db = {}
-                for doc in all_docs[:10]:  # Show first 10
-                    src = doc.get('source', 'UNKNOWN')
-                    if src not in sources_in_db:
-                        sources_in_db[src] = 0
-                    sources_in_db[src] += 1
-                print(f"[DEBUG] Document sources in database:")
-                for src, count in sources_in_db.items():
-                    print(f"  → {src}: {count} documents")
-                if len(all_docs) > 10:
-                    print(f"  ... and {len(all_docs) - 10} more")
-        except Exception as e:
-            print(f"[DEBUG] Could not query database: {e}")
+        # LangGraph: sentinel input -> QA agent (tools) -> output check placeholder
+        self._tools = self._build_tools()
+        self._qa_agent = create_agent(self.llm, self._tools, system_prompt=QA_AGENT_SYS_PROMPT)
+        self._graph = self._build_graph()
 
     def clear_history(self):
-        self.conversation_history = []
+        """Backwards-compatible no-op: history is stored in Supabase per conversation."""
+        return
 
     # ---------------------------
-    # Deterministic Rejection Layer
+    # Sentinel Input Check (Layer 1)
     # ---------------------------
-    def _should_reject(self, user_message: str) -> bool:
-        risky_keywords = [
-            "bypass",
-            "avoid aml",
-            "scam",
-            "trick elderly",
-            "fraud",
-            "circumvent",
-            "exploit",
-            "hack",
-            "override limit",
-            "without detection",
-            "illegal"
-        ]
-        message_lower = user_message.lower()
-        return any(keyword in message_lower for keyword in risky_keywords)
-    
-    # ---------------------------
-    # API-Based Guardrail Layer
-    # ---------------------------
-    def _build_sentinel_messages(self, agent_key: str, user_message: str) -> List[Dict[str, str]]:
-        doc_id = POLICY_DOC_IDS.get(agent_key)
-        if not doc_id:
-            return []
+    def _build_sentinel_messages(self, user_message: str) -> List[Dict[str, str]]:
         return [
-            {"role": "system", "content": make_doc_system_prompt(doc_id)},
+            {"role": "system", "content": QA_AGENT_SYS_PROMPT},
             {"role": "user", "content": user_message},
         ]
 
-    def _check_sentinel_input(self, agent_key: str, user_message: str) -> bool:
+    def _check_sentinel_input(self, user_message: str) -> bool:
         if not self.sentinel_guard.enabled:
             print("[Warning] SENTINEL_API_KEY missing. Skipping Sentinel input check.")
             return False
 
         result = self.sentinel_guard.validate(
             text=user_message,
-            messages=self._build_sentinel_messages(agent_key, user_message),
+            messages=self._build_sentinel_messages(user_message),
         )
         if result.error:
             print(f"[Sentinel Error] {result.error}")
@@ -356,129 +174,188 @@ class WithdrawalChatbot:
             print("[Sentinel Alert] Input blocked by guardrails.")
         return result.blocked
 
-    def _check_sentinel_output(self, agent_key: str, user_message: str, answer: str) -> bool:
-        if not self.sentinel_guard.enabled:
-            return False
+    # ---------------------------
+    # Tools (Layer 2)
+    # ---------------------------
+    def _build_tools(self):
+        user_id = self.user_id
+        db = self.db
+        embedder = self.embedder
+        policy_llm = self.policy_llm
 
-        result = self.sentinel_guard.validate(
-            text=answer,
-            messages=self._build_sentinel_messages(agent_key, user_message),
-        )
-        if result.error:
-            print(f"[Sentinel Error] {result.error}")
-        if result.blocked:
-            print("[Sentinel Alert] Output blocked by guardrails.")
-        return result.blocked
+        @tool("get_account_overview")
+        def get_account_overview() -> str:
+            """Return the user's balance, daily limit, and daily withdrawn (if available)."""
+            snap = db.get_user_account_snapshot(user_id)
+            return (
+                f"Account snapshot (user_id={snap.get('user_id')}):\n"
+                f"- Balance: {snap.get('balance')}\n"
+                f"- Daily limit: {snap.get('daily_limit')}\n"
+            )
+
+        @tool("policy_checker")
+        def policy_checker(question: str) -> str:
+            """Answer policy questions using ONLY approved documents (RAG + LLM)."""
+            question = (question or "").strip()
+            if not question:
+                return "Please provide a question so I can check the approved documents."
+
+            try:
+                query_embedding = embedder.encode(question).tolist()
+                results = db.search_documents(embedding=query_embedding, limit=12, threshold=0.5)
+            except Exception:
+                results = []
+
+            allowed_sources = set(POLICY_DOC_IDS)
+            filtered = [r for r in (results or []) if r.get("source") in allowed_sources and r.get("content")]
+
+            if not filtered:
+                return "I cannot find that information in the approved documents."
+
+            excerpts = []
+            for r in filtered[:6]:
+                excerpts.append(f"SOURCE: {r.get('source')}\n{r.get('content')}")
+
+            msgs = [
+                SystemMessage(content=POLICY_CHECKER_SYS_PROMPT),
+                HumanMessage(content=f"Question:\n{question}\n\nPolicy excerpts:\n\n" + "\n\n".join(excerpts)),
+            ]
+            resp = policy_llm.invoke(msgs)
+            return getattr(resp, "content", str(resp))
+
+        return [get_account_overview, policy_checker]
 
     # ---------------------------
-    # Deterministic Router
+    # LangGraph
     # ---------------------------
-    def _route(self, user_message: str) -> str:
-        """
-        Returns one of:
-          - "withdrawal"
-          - "emergency"
-          - "identity"
-          - "fraud"
-        """
-        m = user_message.lower()
+    def _load_history(self, limit: int = 20) -> List[BaseMessage]:
+        rows = self.db.get_conversation_history(self.conversation_id, limit=limit)
+        messages: List[BaseMessage] = []
+        for r in rows:
+            role = (r.get("role") or "").lower()
+            content = r.get("content") or ""
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+        return messages
 
-        # Emergency signals
-        emergency_terms = [
-            "emergency", "urgent", "asap", "immediately", "medical", "hospital",
-            "family emergency", "bereavement", "funeral", "accident"
-        ]
-        if any(t in m for t in emergency_terms):
-            return "emergency"
+    def _build_graph(self):
+        graph = StateGraph(_ChatState)
 
-        # Identity / authentication / KYC signals
-        identity_terms = [
-            "id", "identity", "verify", "verification", "authenticate", "authentication",
-            "kyc", "otp", "one-time password", "pin", "passcode", "biometric",
-            "face id", "fingerprint", "documents required", "proof of identity"
-        ]
-        if any(t in m for t in identity_terms):
-            return "identity"
+        def load_history_node(state: _ChatState) -> _ChatState:
+            return {"history": self._load_history(limit=20)}
 
-        # Fraud / monitoring signals (note: if you reject on "fraud" keyword above,
-        # remove "fraud" from risky_keywords or adjust logic; otherwise fraud questions
-        # will be rejected before routing.)
-        fraud_terms = [
-            "transaction monitoring", "monitoring", "flagged", "flag", "suspicious",
-            "blocked", "frozen", "hold", "aml", "sar", "scam", "fraud", "phishing",
-            "unauthorized", "chargeback", "investigation", "velocity"
-        ]
-        if any(t in m for t in fraud_terms):
-            return "fraud"
+        def sentinel_node(state: _ChatState) -> _ChatState:
+            user_message = state.get("user_message", "")
+            blocked = self._check_sentinel_input(user_message)
+            if blocked:
+                return {"blocked": True, "answer": _BLOCKED_RESPONSE}
+            return {"blocked": False}
 
-        # Default: general withdrawal policy/procedures
-        return "withdrawal"
+        def qa_agent_node(state: _ChatState) -> _ChatState:
+            if state.get("blocked"):
+                return {}
+            history = state.get("history") or []
+            user_message = state.get("user_message", "")
+            result = self._qa_agent.invoke({"messages": [SystemMessage(content=QA_AGENT_SYS_PROMPT), *history, HumanMessage(content=user_message)]})
+            msgs = result.get("messages") if isinstance(result, dict) else None
+            if isinstance(msgs, list) and msgs:
+                last = msgs[-1]
+                answer = getattr(last, "content", str(last))
+            else:
+                answer = str(result)
+            return {"answer": answer}
+
+        def output_check_node(state: _ChatState) -> _ChatState:
+            # Placeholder for LLM Guard later
+            return {}
+
+        graph.add_node("load_history", load_history_node)
+        graph.add_node("sentinel_input", sentinel_node)
+        graph.add_node("qa_agent", qa_agent_node)
+        graph.add_node("output_check", output_check_node)
+
+        graph.set_entry_point("load_history")
+        graph.add_edge("load_history", "sentinel_input")
+
+        def route_after_sentinel(state: _ChatState) -> str:
+            return "output_check" if state.get("blocked") else "qa_agent"
+
+        graph.add_conditional_edges("sentinel_input", route_after_sentinel, {"qa_agent": "qa_agent", "output_check": "output_check"})
+        graph.add_edge("qa_agent", "output_check")
+        graph.add_edge("output_check", END)
+        return graph.compile()
+
+    def _update_session_summary_best_effort(self) -> None:
+        """Best-effort summary storage (stored in conversations.metadata)."""
+        try:
+            history = self.db.get_conversation_history(self.conversation_id, limit=20)
+            transcript_lines = []
+            for r in history:
+                role = (r.get("role") or "").upper()
+                content = (r.get("content") or "").strip()
+                if not content:
+                    continue
+                transcript_lines.append(f"{role}: {content}")
+            transcript = "\n".join(transcript_lines)[-6000:]
+
+            summarizer = ChatOpenAI(
+                model=self.model,
+                temperature=0,
+                max_tokens=160,
+                api_key=self.api_key,
+            )
+            msgs = [
+                SystemMessage(content="Summarize this customer support chat in 2-4 bullet points, focusing on the user's intent and what the assistant answered."),
+                HumanMessage(content=transcript),
+            ]
+            resp = summarizer.invoke(msgs)
+            summary = getattr(resp, "content", "").strip()
+            if summary:
+                self.db.update_conversation_metadata(
+                    self.conversation_id,
+                    {"session_summary": summary, "summary_updated_at": uuid4().hex},
+                )
+        except Exception:
+            return
 
     # ---------------------------
     # Main Chat Method
     # ---------------------------
     def chat(self, user_message: str, debug: bool = False) -> str:
-        """Chat with the withdrawal assistant and store in Supabase"""
-        # Route to appropriate agent
-        agent_key = self._route(user_message)
+        """Chat with the withdrawal assistant and store in Supabase."""
 
         try:
-            # Store user message in Supabase first (before validation)
+            result = self._graph.invoke({"user_message": user_message})
+            answer = (result or {}).get("answer") or "System error: No answer generated."
+
+            # Store user message (after sentinel input check layer)
             msg_response = self.db.add_message(
                 conversation_id=self.conversation_id,
                 user_id=self.user_id,
                 role="user",
                 content=user_message,
-                metadata={"routed_to": agent_key}
+                metadata={"blocked": bool((result or {}).get("blocked"))},
             )
-            message_id = msg_response.get('id') if isinstance(msg_response, dict) else str(uuid4())
-            
+            message_id = msg_response.get("id") if isinstance(msg_response, dict) else str(uuid4())
+
             # Log audit for message received
             self.db.create_audit_log(
                 user_id=self.user_id,
                 action="message_received",
                 resource="conversation",
-                details={"conversation_id": self.conversation_id, "agent": agent_key}
+                details={"conversation_id": self.conversation_id},
             )
 
-            # Check input safety
-            if self._check_sentinel_input(agent_key, user_message):
-                blocked_response = "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
-                
-                # Flag the stored message
+            # If Sentinel blocked, flag and return
+            if (result or {}).get("blocked"):
                 self.db.flag_message_as_suspicious(
                     message_id=message_id,
                     reason="sentinel_input_blocked",
-                    details={"user_message": user_message[:100], "agent_key": agent_key}
+                    details={"user_message": (user_message or "")[:200]},
                 )
-                return blocked_response
-
-            # Get agent
-            runner = self.policy_agents.get(agent_key)
-            if not runner:
-                return "System error: No agent available for this request."
-            
-            # Prepare conversation history for agent context (last 5 turns)
-            formatted_history = []
-            for msg in self.conversation_history[-5:]:
-                if msg['role'] == 'user':
-                    formatted_history.append(HumanMessage(content=msg['content']))
-                elif msg['role'] == 'assistant':
-                    formatted_history.append(AIMessage(content=msg['content']))
-            # Generate response with conversation history
-            answer = runner(user_message, history=formatted_history)
-
-            # Check output safety
-            if self._check_sentinel_output(agent_key, user_message, answer):
-                blocked_response = "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
-                
-                # Flag the stored user message
-                self.db.flag_message_as_suspicious(
-                    message_id=message_id,
-                    reason="sentinel_output_blocked",
-                    details={"generated_response": answer[:100]}
-                )
-                return blocked_response
+                return answer
 
             # Store assistant response in Supabase
             self.db.add_message(
@@ -486,7 +363,7 @@ class WithdrawalChatbot:
                 user_id=self.user_id,
                 role="assistant",
                 content=answer,
-                metadata={"agent": agent_key}
+                metadata={},
             )
             
             # Log successful response
@@ -494,15 +371,14 @@ class WithdrawalChatbot:
                 user_id=self.user_id,
                 action="response_generated",
                 resource="conversation",
-                details={"conversation_id": self.conversation_id, "response_length": len(answer)}
+                details={"conversation_id": self.conversation_id, "response_length": len(answer)},
             )
 
-            # Update shared history for context
-            self.conversation_history.append(HumanMessage(content=user_message))
-            self.conversation_history.append(AIMessage(content=answer))
+            # Best-effort session summary storage
+            self._update_session_summary_best_effort()
 
             if debug:
-                return f"[DEBUG] routed_to={agent_key}\n\n{answer}"
+                return f"[DEBUG] conversation_id={self.conversation_id}\n\n{answer}"
             return answer
 
         except Exception as e:

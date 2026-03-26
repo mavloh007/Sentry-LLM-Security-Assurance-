@@ -140,6 +140,14 @@ def login():
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    # Best-effort: end DB session record
+    try:
+        session_id = session.get("session_id")
+        if session_id:
+            db.end_session(session_id)
+    except Exception:
+        pass
+
     session.clear()
     return redirect(url_for('login'))
 
@@ -160,6 +168,22 @@ def index():
 @login_required
 def chat():
     # Renders the chatbot page
+    user_id = session.get("user_id")
+    # Ensure a stable conversation per browser session
+    if user_id and not session.get("conversation_id"):
+        conv = db.create_conversation(user_id=user_id, title="Withdrawal Bot Session")
+        session["conversation_id"] = conv.get("id")
+        # Optional: create a DB session row (best-effort)
+        try:
+            s = db.create_session(
+                user_id=user_id,
+                conversation_id=session["conversation_id"],
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get("User-Agent"),
+            )
+            session["session_id"] = s.get("id")
+        except Exception:
+            pass
     return render_template('index.html', email=session.get('email'))
 
 
@@ -169,13 +193,30 @@ def send_chat():
     data = request.json
     user_message = data.get('message', '')
     user_id = session.get('user_id')
+    conversation_id = session.get("conversation_id")
 
     if not user_message:
         return jsonify({"error": "No message provided"}), 400
 
     try:
+        # Ensure conversation exists
+        if user_id and not conversation_id:
+            conv = db.create_conversation(user_id=user_id, title="Withdrawal Bot Session")
+            conversation_id = conv.get("id")
+            session["conversation_id"] = conversation_id
+            try:
+                s = db.create_session(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    ip_address=request.remote_addr,
+                    user_agent=request.headers.get("User-Agent"),
+                )
+                session["session_id"] = s.get("id")
+            except Exception:
+                pass
+
         # Initialize chatbot with authenticated user
-        bot = WithdrawalChatbot(db=db, user_id=user_id)
+        bot = WithdrawalChatbot(db=db, user_id=user_id, conversation_id=conversation_id)
         response = bot.chat(user_message)
         return jsonify({"response": response})
     
