@@ -71,3 +71,6 @@ coverage.xml
 
 # SQLite3 variant
 *.sqlite3
+
+#Claude
+.claude/
