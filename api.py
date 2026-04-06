@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -85,7 +87,14 @@ def search(req: SearchRequest):
         if bot is None or db is None:
             raise HTTPException(status_code=503, detail="Bot/DB not initialized")
 
-        query_embedding = bot.embedder.encode(req.query).tolist()
+        embedding_model = getattr(bot, "embedding_model", os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"))
+        embedding_dimensions = getattr(bot, "embedding_dimensions", int(os.getenv("EMBEDDING_DIMENSIONS", "384")))
+        resp = bot._openai_client.embeddings.create(
+            input=req.query,
+            model=embedding_model,
+            dimensions=embedding_dimensions,
+        )
+        query_embedding = resp.data[0].embedding
         results = db.search_documents(embedding=query_embedding, limit=req.n_results, threshold=0.5)
         documents = [str(r.get("content")) for r in (results or []) if r.get("content")]
         return SearchResponse(documents=documents)

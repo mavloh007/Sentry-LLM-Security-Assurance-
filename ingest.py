@@ -13,6 +13,9 @@ from src.db.supabase_client import SupabaseDB, SupabaseVectorStore
 load_dotenv()
 
 PDF_PATH = "src/documents"
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "384"))
+TEST_SEARCH_THRESHOLD = float(os.getenv("INGEST_TEST_SEARCH_THRESHOLD", "0.5"))
 
 '''
 doc_id's for ref,
@@ -99,7 +102,7 @@ def main():
         print(f"❌ Connection error: {e}")
         return False
 
-    print("📦 Initializing OpenAI embeddings (text-embedding-3-small)...")
+    print(f"📦 Initializing OpenAI embeddings ({EMBEDDING_MODEL}, {EMBEDDING_DIMENSIONS} dims)...")
     openai_client = OpenAI()
     vs = SupabaseVectorStore(db)
     print("✓ Embedding client ready\n")
@@ -128,7 +131,11 @@ def main():
             for i, chunk in enumerate(chunks):
                 try:
                     # Generate embedding
-                    resp = openai_client.embeddings.create(input=chunk, model="text-embedding-3-small")
+                    resp = openai_client.embeddings.create(
+                        input=chunk,
+                        model=EMBEDDING_MODEL,
+                        dimensions=EMBEDDING_DIMENSIONS,
+                    )
                     embedding = resp.data[0].embedding
                     
                     # Insert into Supabase
@@ -180,9 +187,13 @@ def main():
         ]
         
         for query in test_queries:
-            resp = openai_client.embeddings.create(input=query, model="text-embedding-3-small")
+            resp = openai_client.embeddings.create(
+                input=query,
+                model=EMBEDDING_MODEL,
+                dimensions=EMBEDDING_DIMENSIONS,
+            )
             query_embedding = resp.data[0].embedding
-            results = vs.search(query_embedding, limit=2)
+            results = vs.search(query_embedding, limit=2, threshold=TEST_SEARCH_THRESHOLD)
             
             if results:
                 print(f"Query: '{query}'")

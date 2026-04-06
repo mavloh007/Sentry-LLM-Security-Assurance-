@@ -171,6 +171,8 @@ class WithdrawalChatbot:
         # Supabase database
         self.db = db or SupabaseDB()
         self._openai_client = OpenAI(api_key=self.api_key)
+        self.embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        self.embedding_dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", "384"))
         
         # Use provided user_id when authenticated; else fall back to a stable local test user.
         self.user_id = user_id or str(uuid5(NAMESPACE_DNS, "local-test-user"))
@@ -267,7 +269,11 @@ class WithdrawalChatbot:
                 return "Please provide a question so I can check the approved documents."
 
             try:
-                resp = openai_client.embeddings.create(input=question, model="text-embedding-3-small")
+                resp = openai_client.embeddings.create(
+                    input=question,
+                    model=self.embedding_model,
+                    dimensions=self.embedding_dimensions,
+                )
                 query_embedding = resp.data[0].embedding
                 results = db.search_documents(embedding=query_embedding, limit=12, threshold=0.5)
             except Exception:
