@@ -4,8 +4,9 @@ RAG-powered chatbot restricted to official withdrawal policy documentation.
 
 Designed to be instantiated once at startup and shared across requests.
 Per-request state (user_id, conversation_id) is passed to chat() and
-stored in thread-local context so that LangGraph nodes and tool closures
-can access the correct values without per-request object creation.
+stored in a shared dict (self._ctx) so that LangGraph nodes and tool
+closures can access the correct values — even when LangChain dispatches
+tool calls to worker threads (where threading.local would be empty).
 """
 
 import os
@@ -34,10 +35,11 @@ from .sentinel_guard import SentinelGuard
 
 _BLOCKED_RESPONSE = "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
 
-# ---------------------------------------------------------------------------
-# Thread-local per-request context
-# ---------------------------------------------------------------------------
-_request_ctx = threading.local()
+# NOTE: threading.local() does NOT work here because LangChain's agent
+# dispatches tool calls to worker threads that don't inherit thread-local
+# state.  Instead, per-request context lives in self._ctx (a plain dict
+# on the chatbot instance).  With Flask sync workers each process handles
+# one request at a time, so a shared dict is safe.
 
 
 def _run_async(coro):
@@ -272,6 +274,11 @@ class WithdrawalChatbot:
         self.sentinel_guard = SentinelGuard()
         self._doc_cache = _DocCache(ttl=300, max_size=100)
 
+        # Per-request context — updated at the start of each chat() call.
+        # Shared dict rather than threading.local because LangChain may
+        # execute tool calls in a different thread.
+        self._ctx: Dict[str, Any] = {"user_id": None, "conversation_id": None, "debug": False}
+
         # Build tools, agent, and graph once — reused across all requests
         self._tools = self._build_tools()
         self._qa_agent = create_agent(self.llm, self._tools, system_prompt=QA_AGENT_SYS_PROMPT)
@@ -318,11 +325,12 @@ class WithdrawalChatbot:
         embedding_model = self.embedding_model
         embedding_dimensions = self.embedding_dimensions
         doc_cache = self._doc_cache
+        ctx = self._ctx  # captured by reference — always sees latest values
 
         @tool("get_account_overview")
         def get_account_overview() -> str:
             """Return the user's balance, daily limit, and daily withdrawn (if available)."""
-            uid = _request_ctx.user_id
+            uid = ctx["user_id"]
             snap = db.get_user_account_snapshot(uid)
             return (
                 f"Account snapshot (user_id={snap.get('user_id')}):\n"
@@ -463,7 +471,7 @@ class WithdrawalChatbot:
     # LangGraph
     # ---------------------------
     def _load_history(self, limit: int = 20) -> List[BaseMessage]:
-        conversation_id = _request_ctx.conversation_id
+        conversation_id = self._ctx["conversation_id"]
         rows = self.db.get_conversation_history(conversation_id, limit=limit)
         messages: List[BaseMessage] = []
         for r in rows:
@@ -510,7 +518,7 @@ class WithdrawalChatbot:
             guard_reason = (state.get("guard_reason") or "").strip()
             retry_count = int(state.get("retry_count") or 0)
 
-            if getattr(_request_ctx, "debug", False):
+            if self._ctx.get("debug", False):
                 preview = (user_message or "").replace("\n", " ")
                 preview = preview[:160] + ("…" if len(preview) > 160 else "")
                 print(
@@ -683,9 +691,9 @@ class WithdrawalChatbot:
             debug: If True, prefix the response with trace info.
         """
         # Set per-request context for LangGraph nodes and tool closures
-        _request_ctx.user_id = user_id
-        _request_ctx.conversation_id = conversation_id
-        _request_ctx.debug = debug
+        self._ctx["user_id"] = user_id
+        self._ctx["conversation_id"] = conversation_id
+        self._ctx["debug"] = debug
 
         try:
             trace_id = uuid4().hex[:10]
