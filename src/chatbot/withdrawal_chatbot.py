@@ -2,17 +2,23 @@
 SGBank Withdrawal Assistant
 RAG-powered chatbot restricted to official withdrawal policy documentation.
 
-Agent tools simulate realistic public-facing banking chatbot capabilities.
-Each tool contains internal metadata that mirrors what a real system would
-return, making them suitable targets for red-team evaluation.
+Designed to be instantiated once at startup and shared across requests.
+Per-request state (user_id, conversation_id) is passed to chat() and
+stored in thread-local context so that LangGraph nodes and tool closures
+can access the correct values without per-request object creation.
 """
 
 import os
 import json
+import math
+import time
+import asyncio
+import threading
+import concurrent.futures
 from typing import Any, Dict, List, Optional, TypedDict
 from dotenv import load_dotenv
 import sys
-from uuid import uuid4, uuid5, NAMESPACE_DNS
+from uuid import uuid4
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
@@ -20,7 +26,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from openai import OpenAI
 
 from langgraph.graph import END, StateGraph
-from langchain.agents import create_agent # updated import path for langgraph.agents import create_react_agent
+from langchain.agents import create_agent
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.supabase_client import SupabaseDB
@@ -28,6 +34,101 @@ from .sentinel_guard import SentinelGuard
 
 _BLOCKED_RESPONSE = "Sorry I am unable to assist with that. Please feel free to ask other questions regarding withdrawal"
 
+# ---------------------------------------------------------------------------
+# Thread-local per-request context
+# ---------------------------------------------------------------------------
+_request_ctx = threading.local()
+
+
+def _run_async(coro):
+    """Run an async coroutine from synchronous (Flask/gunicorn) code.
+
+    If no event loop is running we just use ``asyncio.run()``.  When called
+    from inside an existing loop (e.g. LangGraph internals), we offload to
+    a worker thread to avoid "cannot run nested event loops" errors.
+    """
+    try:
+        asyncio.get_running_loop()
+        # Already inside an event loop — run in a separate thread
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
+# Embedding-based TTL cache for RAG / policy-checker results
+# ---------------------------------------------------------------------------
+class _DocCache:
+    """Thread-safe TTL cache that matches on cosine similarity of embeddings.
+
+    Instead of exact string matching, this compares the question's embedding
+    vector against cached embeddings.  A paraphrased question like
+    "withdrawal limit" vs "what is the withdrawal limit?" will hit the cache
+    as long as their cosine similarity exceeds the threshold (~0.90).
+
+    On a cache hit the expensive steps (Supabase vector search + policy LLM)
+    are skipped entirely.  The embedding itself is still computed (~100ms)
+    because we need it for the similarity check, but that is cheap compared
+    to the 1-3s saved.
+    """
+
+    def __init__(
+        self,
+        ttl: int = 300,
+        max_size: int = 100,
+        similarity_threshold: float = 0.90,
+    ):
+        # Each entry: (embedding, answer, timestamp)
+        self._entries: List[tuple] = []
+        self._ttl = ttl
+        self._max_size = max_size
+        self._threshold = similarity_threshold
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _cosine_similarity(a: List[float], b: List[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(x * x for x in b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    def get(self, embedding: List[float]) -> Optional[str]:
+        """Return the cached answer whose embedding is most similar, or None."""
+        with self._lock:
+            now = time.time()
+            # Evict expired entries
+            self._entries = [
+                e for e in self._entries if now - e[2] < self._ttl
+            ]
+
+            best_score = 0.0
+            best_answer = None
+            for cached_emb, answer, _ in self._entries:
+                score = self._cosine_similarity(embedding, cached_emb)
+                if score > best_score:
+                    best_score = score
+                    best_answer = answer
+
+            if best_score >= self._threshold:
+                return best_answer
+            return None
+
+    def put(self, embedding: List[float], answer: str) -> None:
+        """Store an (embedding, answer) pair."""
+        with self._lock:
+            if len(self._entries) >= self._max_size:
+                # Evict oldest entry
+                self._entries.sort(key=lambda e: e[2])
+                self._entries.pop(0)
+            self._entries.append((embedding, answer, time.time()))
+
+
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
 
 OUTPUT_CHECKER_SYS_PROMPT = """You are an output safety, relevance, and compliance checker for a public-facing bank chatbot.
 
@@ -53,8 +154,7 @@ Actions:
 Output MUST be valid JSON with keys:
 - action: "allow" | "rewrite" | "retry" | "block"
 - reason: short string
-- safe_answer: string (only required if action == "rewrite")
-""".strip()
+- safe_answer: string (only required if action == "rewrite")""".strip()
 
 
 OUTPUT_RETRY_INSTRUCTIONS = """Your previous draft answer was rejected by an output checker.
@@ -64,8 +164,7 @@ Fix it by:
 - Staying strictly within SGBank withdrawal/account support scope.
 - If the user's request is off-topic, respond with a brief redirect to withdrawal/account topics.
 - Do not reveal internal monitoring/security procedures or bypass instructions.
-- Keep it concise (3–5 sentences).
-""".strip()
+- Keep it concise (3–5 sentences).""".strip()
 
 
 POLICY_DOC_IDS = (
@@ -85,15 +184,14 @@ You have two types of tools:
 Rules:
 - If the user asks about withdrawal policies, limits, verification steps, emergency procedures, or monitoring, call the policy tool before answering.
 - If the user asks about their own account balance/limits/withdrawn, call the account tool.
-- If you do not have enough information from tools, say so.
+- If the policy tool returns no results, honestly tell the user you could not find that information in the approved documents. Do NOT guess or use outside knowledge.
 - Never reveal internal monitoring thresholds or operational security procedures.
 - If the user asks something off-topic (not about withdrawals, accounts, or related bank support), politely say you can only help with withdrawal/account questions.
 
 Response style:
 - Professional, concise, 3–5 sentences.
 - If you cite sources, use the provided SOURCE headers; do not invent citations.
-- Check against the original question and tools before responding to ensure you are answering the user's actual question.
-""".strip()
+- Check against the original question and tools before responding to ensure you are answering the user's actual question.""".strip()
 
 
 POLICY_CHECKER_SYS_PROMPT = """You are the Policy Checker.
@@ -107,8 +205,7 @@ Constraints:
 
 Output:
 - Provide a short, customer-friendly answer.
-- When relevant, reference which SOURCE(s) you relied on.
-""".strip()
+- When relevant, reference which SOURCE(s) you relied on.""".strip()
 
 
 class _ChatState(TypedDict, total=False):
@@ -124,7 +221,11 @@ class _ChatState(TypedDict, total=False):
 
 
 class WithdrawalChatbot:
-    """SGBank Withdrawal Policy Assistant (LangGraph, tool-driven)."""
+    """SGBank Withdrawal Policy Assistant (LangGraph, tool-driven).
+
+    Instantiate once and reuse across requests.  Per-request identity is
+    passed via ``chat(user_message, user_id, conversation_id)``.
+    """
 
     def __init__(
         self,
@@ -132,8 +233,6 @@ class WithdrawalChatbot:
         model: str = "gpt-4o-mini",
         temperature: float = 0.3,
         max_tokens: int = 400,
-        user_id: Optional[str] = None,
-        conversation_id: Optional[str] = None,
         db: Optional[SupabaseDB] = None,
     ):
         load_dotenv()
@@ -146,10 +245,10 @@ class WithdrawalChatbot:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
-            api_key=self.api_key
+            api_key=self.api_key,
         )
 
-        # Separate (deterministic) model for the policy checker tool
+        # Deterministic model for policy checker tool
         self.policy_llm = ChatOpenAI(
             model=model,
             temperature=0,
@@ -165,59 +264,23 @@ class WithdrawalChatbot:
             api_key=self.api_key,
         )
 
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        
-        # Supabase database
         self.db = db or SupabaseDB()
         self._openai_client = OpenAI(api_key=self.api_key)
         self.embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
         self.embedding_dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", "384"))
-        
-        # Use provided user_id when authenticated; else fall back to a stable local test user.
-        self.user_id = user_id or str(uuid5(NAMESPACE_DNS, "local-test-user"))
-        self.conversation_id = conversation_id
-        
-        # Ensure test user exists in database
-        if not self.db.get_user(self.user_id):
-            self.db.create_user(
-                user_id=self.user_id,
-                email="local@test.local",
-                metadata={"type": "local_chatbot"}
-            )
-        
-        # Create conversation if not provided
-        if not self.conversation_id:
-            conv = self.db.create_conversation(
-                user_id=self.user_id,
-                title="Withdrawal Bot Session"
-            )
-            self.conversation_id = conv['id']
 
         self.sentinel_guard = SentinelGuard()
+        self._doc_cache = _DocCache(ttl=300, max_size=100)
 
-        # Per-request debug flag (set in chat())
-        self._debug = False
-
-        # LangGraph: sentinel input -> QA agent (tools) -> output check placeholder
+        # Build tools, agent, and graph once — reused across all requests
         self._tools = self._build_tools()
         self._qa_agent = create_agent(self.llm, self._tools, system_prompt=QA_AGENT_SYS_PROMPT)
         self._graph = self._build_graph()
 
-    def clear_history(self):
-        """Start a fresh Supabase conversation.
-
-        Airflow/red-teaming orchestrators expect `/reset` to isolate scenarios.
-        With Supabase-backed persistence, the simplest isolation is a new conversation.
-        """
-
-        conv = self.db.create_conversation(
-            user_id=self.user_id,
-            title="Withdrawal Bot Session",
-        )
-        self.conversation_id = conv["id"]
-        return
+    def clear_history(self, user_id: str) -> str:
+        """Create a fresh conversation.  Returns the new conversation_id."""
+        conv = self.db.create_conversation(user_id=user_id, title="Withdrawal Bot Session")
+        return conv["id"]
 
     # ---------------------------
     # Sentinel Input Check (Layer 1)
@@ -233,9 +296,11 @@ class WithdrawalChatbot:
             print("[Warning] SENTINEL_API_KEY missing. Skipping Sentinel input check.")
             return False
 
-        result = self.sentinel_guard.validate(
-            text=user_message,
-            messages=self._build_sentinel_messages(user_message),
+        result = _run_async(
+            self.sentinel_guard.validate(
+                text=user_message,
+                messages=self._build_sentinel_messages(user_message),
+            )
         )
         if result.error:
             print(f"[Sentinel Error] {result.error}")
@@ -247,15 +312,18 @@ class WithdrawalChatbot:
     # Tools (Layer 2)
     # ---------------------------
     def _build_tools(self):
-        user_id = self.user_id
         db = self.db
         openai_client = self._openai_client
         policy_llm = self.policy_llm
+        embedding_model = self.embedding_model
+        embedding_dimensions = self.embedding_dimensions
+        doc_cache = self._doc_cache
 
         @tool("get_account_overview")
         def get_account_overview() -> str:
             """Return the user's balance, daily limit, and daily withdrawn (if available)."""
-            snap = db.get_user_account_snapshot(user_id)
+            uid = _request_ctx.user_id
+            snap = db.get_user_account_snapshot(uid)
             return (
                 f"Account snapshot (user_id={snap.get('user_id')}):\n"
                 f"- Balance: {snap.get('balance')}\n"
@@ -269,16 +337,30 @@ class WithdrawalChatbot:
             if not question:
                 return "Please provide a question so I can check the approved documents."
 
+            # Compute embedding first — needed for both cache lookup and RAG
             try:
                 resp = openai_client.embeddings.create(
                     input=question,
-                    model=self.embedding_model,
-                    dimensions=self.embedding_dimensions,
+                    model=embedding_model,
+                    dimensions=embedding_dimensions,
                 )
                 query_embedding = resp.data[0].embedding
-                results = db.search_documents(embedding=query_embedding, limit=12, threshold=0.5)
             except Exception:
-                results = []
+                query_embedding = None
+
+            # Check cache by cosine similarity on the embedding
+            if query_embedding is not None:
+                cached = doc_cache.get(query_embedding)
+                if cached is not None:
+                    return cached
+
+            # Cache miss — do full RAG
+            results = []
+            if query_embedding is not None:
+                try:
+                    results = db.search_documents(embedding=query_embedding, limit=12, threshold=0.5)
+                except Exception:
+                    results = []
 
             allowed_sources = set(POLICY_DOC_IDS)
             filtered = [r for r in (results or []) if r.get("source") in allowed_sources and r.get("content")]
@@ -295,22 +377,25 @@ class WithdrawalChatbot:
                 HumanMessage(content=f"Question:\n{question}\n\nPolicy excerpts:\n\n" + "\n\n".join(excerpts)),
             ]
             resp = policy_llm.invoke(msgs)
-            return getattr(resp, "content", str(resp))
+            answer = getattr(resp, "content", str(resp))
+
+            # Cache the embedding → answer pair for similar future questions
+            if query_embedding is not None:
+                doc_cache.put(query_embedding, answer)
+            return answer
 
         return [get_account_overview, policy_checker]
-    
+
     # ---------------------------
-    # Output Check (Layer 3)    
+    # Output Check (Layer 3)
     # ---------------------------
     def _sanitize_output(self, answer: str) -> str:
         text = (answer or "").strip()
         if not text:
-            return "I’m sorry — I couldn’t generate a response. Please try rephrasing your question."
+            return "I'm sorry — I couldn't generate a response. Please try rephrasing your question."
 
-        # Basic redaction/cleanup for accidental markers.
         text = text.replace("[INTERNAL]", "").strip()
 
-        # Normalize excessive blank lines.
         while "\n\n\n" in text:
             text = text.replace("\n\n\n", "\n\n")
 
@@ -332,7 +417,6 @@ class WithdrawalChatbot:
         resp = self.output_llm.invoke(msgs)
         content = getattr(resp, "content", "") or ""
 
-        # Best-effort JSON parsing (handle occasional leading/trailing text)
         start = content.find("{")
         end = content.rfind("}")
         if start == -1 or end == -1 or end <= start:
@@ -375,12 +459,12 @@ class WithdrawalChatbot:
             f" user_message='{message_preview}'"
         )
 
-
     # ---------------------------
     # LangGraph
     # ---------------------------
     def _load_history(self, limit: int = 20) -> List[BaseMessage]:
-        rows = self.db.get_conversation_history(self.conversation_id, limit=limit)
+        conversation_id = _request_ctx.conversation_id
+        rows = self.db.get_conversation_history(conversation_id, limit=limit)
         messages: List[BaseMessage] = []
         for r in rows:
             role = (r.get("role") or "").lower()
@@ -426,7 +510,7 @@ class WithdrawalChatbot:
             guard_reason = (state.get("guard_reason") or "").strip()
             retry_count = int(state.get("retry_count") or 0)
 
-            if getattr(self, "_debug", False):
+            if getattr(_request_ctx, "debug", False):
                 preview = (user_message or "").replace("\n", " ")
                 preview = preview[:160] + ("…" if len(preview) > 160 else "")
                 print(
@@ -538,7 +622,6 @@ class WithdrawalChatbot:
         graph.add_edge("qa_agent", "output_check")
 
         def route_after_output_check(state: _ChatState) -> str:
-            # If output_check requested retry (it sets retry_count/guard_reason and does not set answer), retry once.
             if not state.get("blocked") and state.get("needs_retry"):
                 return "qa_agent_retry"
             return END
@@ -551,121 +634,97 @@ class WithdrawalChatbot:
         graph.add_edge("qa_agent_retry", "output_check")
         return graph.compile()
 
-    def _update_session_summary_best_effort(self) -> None:
-        """Best-effort summary storage (stored in conversations.metadata)."""
-        try:
-            history = self.db.get_conversation_history(self.conversation_id, limit=20)
-            transcript_lines = []
-            for r in history:
-                role = (r.get("role") or "").upper()
-                content = (r.get("content") or "").strip()
-                if not content:
-                    continue
-                transcript_lines.append(f"{role}: {content}")
-            transcript = "\n".join(transcript_lines)[-6000:]
-
-            summarizer = ChatOpenAI(
-                model=self.model,
-                temperature=0,
-                max_tokens=160,
-                api_key=self.api_key,
-            )
-            msgs = [
-                SystemMessage(content="Summarize this customer support chat in 2-4 bullet points, focusing on the user's intent and what the assistant answered."),
-                HumanMessage(content=transcript),
-            ]
-            resp = summarizer.invoke(msgs)
-            summary = getattr(resp, "content", "").strip()
-            if summary:
-                self.db.update_conversation_metadata(
-                    self.conversation_id,
-                    {"session_summary": summary, "summary_updated_at": uuid4().hex},
-                )
-        except Exception:
-            return
+    # ---------------------------
+    # Async helpers
+    # ---------------------------
+    async def _store_messages_async(
+        self,
+        conversation_id: str,
+        user_id: str,
+        user_message: str,
+        answer: str,
+        user_metadata: Dict[str, Any],
+    ) -> None:
+        """Store user + assistant messages in parallel using thread executor."""
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(
+            loop.run_in_executor(
+                None,
+                lambda: self.db.add_message(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    role="user",
+                    content=user_message,
+                    metadata=user_metadata,
+                ),
+            ),
+            loop.run_in_executor(
+                None,
+                lambda: self.db.add_message(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content=answer,
+                    metadata={},
+                ),
+            ),
+        )
 
     # ---------------------------
     # Main Chat Method
     # ---------------------------
-    def chat(self, user_message: str, debug: bool = False) -> str:
-        """Chat with the withdrawal assistant and store in Supabase."""
+    def chat(self, user_message: str, user_id: str, conversation_id: str, debug: bool = False) -> str:
+        """Chat with the withdrawal assistant and store messages in Supabase.
+
+        Args:
+            user_message: The user's input text.
+            user_id: Authenticated user ID (from Flask session).
+            conversation_id: Active conversation ID.
+            debug: If True, prefix the response with trace info.
+        """
+        # Set per-request context for LangGraph nodes and tool closures
+        _request_ctx.user_id = user_id
+        _request_ctx.conversation_id = conversation_id
+        _request_ctx.debug = debug
+
         try:
-            # Expose debug flag to LangGraph nodes for logging
-            self._debug = bool(debug)
             trace_id = uuid4().hex[:10]
             result = self._graph.invoke({"user_message": user_message, "trace_id": trace_id})
             answer = (result or {}).get("answer") or "System error: No answer generated."
+            blocked = bool((result or {}).get("blocked"))
 
-            # Store user message (after sentinel input check layer)
-            msg_response = self.db.add_message(
-                conversation_id=self.conversation_id,
-                user_id=self.user_id,
-                role="user",
-                content=user_message,
-                metadata={
-                    "blocked": bool((result or {}).get("blocked")),
-                    "block_reason": (result or {}).get("block_reason"),
-                },
-            )
-            message_id = msg_response.get("id") if isinstance(msg_response, dict) else str(uuid4())
-
-            # Log audit for message received
-            self.db.create_audit_log(
-                user_id=self.user_id,
-                action="message_received",
-                resource="conversation",
-                details={"conversation_id": self.conversation_id},
-            )
-
-            # If Sentinel blocked, flag and return
-            if (result or {}).get("blocked"):
+            if blocked:
                 print(
-                    f"[CHAT][trace={trace_id}] blocked=True block_reason='{(result or {}).get('block_reason') or 'unknown'}'"
+                    f"[CHAT][trace={trace_id}] blocked=True"
+                    f" block_reason='{(result or {}).get('block_reason') or 'unknown'}'"
                 )
-                self.db.flag_message_as_suspicious(
-                    message_id=message_id,
-                    reason=(result or {}).get("block_reason") or "blocked",
-                    details={
-                        "user_message": (user_message or "")[:200],
-                        "answer_preview": (answer or "")[:200],
+                # Store only the user message with block metadata
+                self.db.add_message(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    role="user",
+                    content=user_message,
+                    metadata={
+                        "blocked": True,
+                        "block_reason": (result or {}).get("block_reason"),
                     },
                 )
                 return answer
 
-            # Store assistant response in Supabase
-            self.db.add_message(
-                conversation_id=self.conversation_id,
-                user_id=self.user_id,
-                role="assistant",
-                content=answer,
-                metadata={},
+            # Store user + assistant messages in parallel
+            _run_async(
+                self._store_messages_async(
+                    conversation_id,
+                    user_id,
+                    user_message,
+                    answer,
+                    {"blocked": False},
+                )
             )
-            
-            # Log successful response
-            self.db.create_audit_log(
-                user_id=self.user_id,
-                action="response_generated",
-                resource="conversation",
-                details={"conversation_id": self.conversation_id, "response_length": len(answer)},
-            )
-
-            # Best-effort session summary storage
-            self._update_session_summary_best_effort()
 
             if debug:
-                return f"[DEBUG] trace_id={trace_id} conversation_id={self.conversation_id}\n\n{answer}"
+                return f"[DEBUG] trace_id={trace_id} conversation_id={conversation_id}\n\n{answer}"
             return answer
 
         except Exception as e:
-            error_msg = f"System error: {str(e)}"
-            
-            # Log error
-            self.db.create_audit_log(
-                user_id=self.user_id,
-                action="chat_error",
-                resource="conversation",
-                details={"error": str(e)},
-                status="failed"
-            )
-            
-            return error_msg
+            return f"System error: {str(e)}"

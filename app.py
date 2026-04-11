@@ -42,7 +42,9 @@ except Exception as e:
     print(f"ERROR initializing database: {e}")
     raise
 
-print("✓ Withdrawal Chatbot initialized with Supabase backend")
+# Initialize chatbot ONCE — reused across all requests
+bot = WithdrawalChatbot(db=db)
+print("✓ Withdrawal Chatbot initialized (cached instance)")
 
 # ===================================
 # Authentication Decorator
@@ -74,11 +76,7 @@ def _set_active_conversation(user_id: str, conversation_id: str) -> bool:
     conversation = db.get_conversation(conversation_id)
     if not conversation or conversation.get("user_id") != user_id:
         return False
-
     session["conversation_id"] = conversation_id
-    session_id = session.get("session_id")
-    if session_id:
-        db.client.table("sessions").update({"conversation_id": conversation_id}).eq("id", session_id).execute()
     return True
 
 # ===================================
@@ -91,45 +89,45 @@ def register():
         email = request.form.get('email', '').strip()
         password = request.form.get('password', '').strip()
         confirm_password = request.form.get('confirm_password', '').strip()
-        
+
         if not email or not password:
             return render_template('register.html', error='Email and password required')
-         
+
         if password != confirm_password:
             return render_template('register.html', error='Passwords do not match')
-        
+
         if len(password) < 6:
             return render_template('register.html', error='Password must be at least 6 characters')
-        
+
         try:
             # Sign up with Supabase Auth
             response = db.client.auth.sign_up({
                 "email": email,
                 "password": password
             })
-            
+
             user_id = response.user.id
-            
+
             # Create user in our users table
             db.create_user(
                 user_id=user_id,
                 email=email,
                 metadata={"signup_method": "email", "created_at": str(uuid4())}
             )
-            
+
             # Auto-login after signup
             session['user_id'] = user_id
             session['email'] = email
             session.permanent = True
-            
+
             return redirect(url_for('chat'))
-        
+
         except Exception as e:
             error_msg = str(e)
             if 'already registered' in error_msg.lower():
                 error_msg = 'Email already registered. Please login instead.'
             return render_template('register.html', error=error_msg)
-    
+
     return render_template('register.html')
 
 
@@ -138,42 +136,34 @@ def login():
     if request.method == 'POST':
         email = request.form.get('email', '').strip()
         password = request.form.get('password', '').strip()
-        
+
         if not email or not password:
             return render_template('login.html', error='Email and password required')
-        
+
         try:
             # Sign in with Supabase Auth
             response = db.client.auth.sign_in_with_password({
                 "email": email,
                 "password": password
             })
-            
+
             user_id = response.user.id
-            
+
             # Store in session
             session['user_id'] = user_id
             session['email'] = email
             session.permanent = True
-            
+
             return redirect(url_for('chat'))
-        
+
         except Exception as e:
             return render_template('login.html', error='Invalid email or password')
-    
+
     return render_template('login.html')
 
 
 @app.route('/logout', methods=['POST'])
 def logout():
-    # Best-effort: end DB session record
-    try:
-        session_id = session.get("session_id")
-        if session_id:
-            db.end_session(session_id)
-    except Exception:
-        pass
-
     session.clear()
     return redirect(url_for('login'))
 
@@ -184,7 +174,6 @@ def logout():
 
 @app.route('/')
 def index():
-    # Redirect to login if not authenticated
     if 'user_id' not in session:
         return redirect(url_for('login'))
     return redirect(url_for('chat'))
@@ -193,23 +182,10 @@ def index():
 @app.route('/chat')
 @login_required
 def chat():
-    # Renders the chatbot page
     user_id = session.get("user_id")
-    # Ensure a stable conversation per browser session
     if user_id and not session.get("conversation_id"):
         conv = db.create_conversation(user_id=user_id, title="Withdrawal Bot Session")
         session["conversation_id"] = conv.get("id")
-        # Optional: create a DB session row (best-effort)
-        try:
-            s = db.create_session(
-                user_id=user_id,
-                conversation_id=session["conversation_id"],
-                ip_address=request.remote_addr,
-                user_agent=request.headers.get("User-Agent"),
-            )
-            session["session_id"] = s.get("id")
-        except Exception:
-            pass
     return render_template('index.html', email=session.get('email'))
 
 
@@ -229,45 +205,31 @@ def send_chat():
         return jsonify({"error": "No message provided"}), 400
 
     try:
+        # Switch to a different existing conversation if requested
         if conversation_id and conversation_id != session.get("conversation_id"):
             if not _set_active_conversation(user_id, conversation_id):
                 return jsonify({"error": "Conversation not found"}), 404
 
-        # Ensure conversation exists
+        # Create a new conversation if needed
         if user_id and not conversation_id:
             conv_title = requested_title or _derive_conversation_title(user_message)
             conv = db.create_conversation(user_id=user_id, title=conv_title)
             conversation_id = conv.get("id")
             session["conversation_id"] = conversation_id
-            session_id = session.get("session_id")
-            if session_id:
-                try:
-                    db.client.table("sessions").update({"conversation_id": conversation_id}).eq("id", session_id).execute()
-                except Exception:
-                    pass
-            else:
-                try:
-                    s = db.create_session(
-                        user_id=user_id,
-                        conversation_id=conversation_id,
-                        ip_address=request.remote_addr,
-                        user_agent=request.headers.get("User-Agent"),
-                    )
-                    session["session_id"] = s.get("id")
-                except Exception:
-                    pass
 
-        # Initialize chatbot with authenticated user
-        bot = WithdrawalChatbot(db=db, user_id=user_id, conversation_id=conversation_id)
-        response = bot.chat(user_message)
+        # Use the cached chatbot — pass per-request identity
+        response = bot.chat(user_message, user_id=user_id, conversation_id=conversation_id)
 
-        conversation = db.get_conversation(conversation_id)
+        # Return the conversation list in the same response (avoids a 2nd round-trip)
+        conversations = db.get_user_conversations(user_id)
+
         return jsonify({
             "response": response,
             "conversation_id": conversation_id,
-            "conversation_title": (conversation or {}).get("title"),
+            "conversations": conversations,
+            "active_conversation_id": conversation_id,
         })
-    
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -277,7 +239,7 @@ def send_chat():
 def get_history():
     """Get conversation history for logged-in user"""
     user_id = session.get('user_id')
-    
+
     try:
         history = db.get_user_conversations(user_id)
         return jsonify({"conversations": history})
@@ -324,5 +286,4 @@ def get_conversation_messages(conversation_id):
 
 
 if __name__ == '__main__':
-    # Running Flask in debug mode for development
     app.run(debug=True, port=3000)

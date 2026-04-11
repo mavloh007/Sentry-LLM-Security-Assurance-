@@ -234,7 +234,12 @@ async function sendMessage() {
                 activeConversationId = data.conversation_id;
                 pendingTitle = '';
             }
-            await refreshConversations();
+            // Use the conversation list returned in the chat response
+            // instead of making a separate GET /api/conversations call
+            if (data.conversations) {
+                conversations = Array.isArray(data.conversations) ? data.conversations : [];
+                activeConversationId = data.active_conversation_id || activeConversationId;
+            }
             renderHistoryList();
         }
     } catch (error) {

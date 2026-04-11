@@ -5,7 +5,7 @@ Handles authentication, conversations, embeddings, and audit logging
 
 import os
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 from uuid import uuid4
 import json
 
@@ -275,82 +275,23 @@ class SupabaseDB:
         limit: int = 5,
         threshold: float = 0.7,
     ) -> List[Dict[str, Any]]:
-        """Search documents using vector similarity (pgvector)"""
+        """Search documents using vector similarity via Supabase RPC (pgvector).
+
+        Requires the ``search_documents`` RPC function to be set up in Supabase.
+        Returns an empty list on failure so the caller can degrade gracefully.
+        """
         try:
-            # Try using RPC function first
-            try:
-                response = self.client.rpc(
-                    "search_documents",
-                    {
-                        "query_embedding": embedding,
-                        "match_limit": limit,
-                        "match_threshold": threshold,
-                    },
-                ).execute()
-                if response.data:
-                    return response.data
-            except Exception as rpc_error:
-                print(f"[DEBUG] RPC function failed: {rpc_error}")
-                print(f"[DEBUG] Falling back to direct vector search...")
-            
-            # Fallback: Direct vector search using PostgreSQL operators
-            # Convert embedding to string format pgvector expects
-            embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-            
-            response = (
-                self.client.table("documents")
-                .select("id, content, source, metadata, embedding")
-                .execute()
-            )
-            
-            if not response.data:
-                return []
-            
-            # Calculate similarity scores locally
-            import math
-            results = []
-            for doc in response.data:
-                if doc.get('embedding'):
-                    # Calculate cosine similarity
-                    doc_emb = doc.get('embedding')
-                    if isinstance(doc_emb, str):
-                        # Parse if it's a string
-                        import json
-                        try:
-                            doc_emb = json.loads(doc_emb)
-                        except:
-                            continue
-                    
-                    # Cosine similarity
-                    dot_product = sum(a * b for a, b in zip(embedding, doc_emb))
-                    norm_q = math.sqrt(sum(a * a for a in embedding))
-                    norm_d = math.sqrt(sum(a * a for a in doc_emb))
-                    
-                    if norm_q > 0 and norm_d > 0:
-                        similarity = dot_product / (norm_q * norm_d)
-                    else:
-                        similarity = 0
-                    
-                    # Convert to distance for threshold comparison
-                    distance = 1 - similarity
-                    
-                    if distance < (1 - threshold):  # If similarity > threshold
-                        results.append({
-                            "id": doc.get("id"),
-                            "content": doc.get("content"),
-                            "source": doc.get("source"),
-                            "similarity": similarity,
-                            "distance": distance
-                        })
-            
-            # Sort by similarity (descending) and return top K
-            results.sort(key=lambda x: x["similarity"], reverse=True)
-            return results[:limit]
-            
+            response = self.client.rpc(
+                "search_documents",
+                {
+                    "query_embedding": embedding,
+                    "match_limit": limit,
+                    "match_threshold": threshold,
+                },
+            ).execute()
+            return response.data if response.data else []
         except Exception as e:
             print(f"Error searching documents: {e}")
-            import traceback
-            traceback.print_exc()
             return []
 
     def get_all_documents(self, doc_type: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -363,146 +304,6 @@ class SupabaseDB:
             return response.data if response.data else []
         except postgrest_exceptions.APIError as e:
             print(f"Error fetching documents: {e}")
-            return []
-
-    # ==================== AUDIT LOGGING ====================
-
-    def create_audit_log(
-        self,
-        user_id: str,
-        action: str,
-        resource: str,
-        details: Optional[Dict] = None,
-        status: str = "success",
-    ) -> Dict[str, Any]:
-        """Create an audit log entry"""
-        try:
-            log_data = {
-                "id": str(uuid4()),
-                "user_id": user_id,
-                "action": action,
-                "resource": resource,
-                "details": details or {},
-                "status": status,
-                "created_at": datetime.utcnow().isoformat(),
-            }
-            response = self.client.table("audit_logs").insert(log_data).execute()
-            return response.data[0] if response.data else log_data
-        except postgrest_exceptions.APIError as e:
-            print(f"Error creating audit log: {e}")
-            return log_data
-
-    def get_user_audit_logs(
-        self,
-        user_id: str,
-        limit: int = 100,
-        action: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Get audit logs for a user"""
-        try:
-            query = self.client.table("audit_logs").select("*").eq("user_id", user_id)
-            if action:
-                query = query.eq("action", action)
-            response = query.order("created_at", desc=True).limit(limit).execute()
-            return response.data if response.data else []
-        except postgrest_exceptions.APIError as e:
-            print(f"Error fetching audit logs: {e}")
-            return []
-
-    # ==================== SESSION MANAGEMENT ====================
-
-    def create_session(
-        self,
-        user_id: str,
-        conversation_id: str,
-        ip_address: Optional[str] = None,
-        user_agent: Optional[str] = None,
-        expires_in_hours: int = 24,
-    ) -> Dict[str, Any]:
-        """Create a user session"""
-        try:
-            session_data = {
-                "id": str(uuid4()),
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "ip_address": ip_address,
-                "user_agent": user_agent,
-                "created_at": datetime.utcnow().isoformat(),
-                "expires_at": (datetime.utcnow() + timedelta(hours=expires_in_hours)).isoformat(),
-                "is_active": True,
-            }
-            response = self.client.table("sessions").insert(session_data).execute()
-            return response.data[0] if response.data else session_data
-        except postgrest_exceptions.APIError as e:
-            print(f"Error creating session: {e}")
-            raise
-
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get session by ID"""
-        try:
-            response = (
-                self.client.table("sessions")
-                .select("*")
-                .eq("id", session_id)
-                .single()
-                .execute()
-            )
-            return response.data if response.data else None
-        except postgrest_exceptions.APIError as e:
-            print(f"Error fetching session: {e}")
-            return None
-
-    def end_session(self, session_id: str) -> bool:
-        """End a session"""
-        try:
-            response = (
-                self.client.table("sessions")
-                .update({"is_active": False})
-                .eq("id", session_id)
-                .execute()
-            )
-            return bool(response.data)
-        except postgrest_exceptions.APIError as e:
-            print(f"Error ending session: {e}")
-            return False
-
-    # ==================== CONVERSATION SAFETY & METADATA ====================
-
-    def flag_message_as_suspicious(
-        self,
-        message_id: str,
-        reason: str,
-        details: Optional[Dict] = None,
-    ) -> Dict[str, Any]:
-        """Flag a message for review (security audit)"""
-        try:
-            flag_data = {
-                "id": str(uuid4()),
-                "message_id": message_id,
-                "reason": reason,
-                "details": details or {},
-                "flagged_at": datetime.utcnow().isoformat(),
-                "reviewed": False,
-            }
-            response = self.client.table("message_flags").insert(flag_data).execute()
-            return response.data[0] if response.data else flag_data
-        except postgrest_exceptions.APIError as e:
-            print(f"Error flagging message: {e}")
-            raise
-
-    def get_flagged_messages(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get flagged messages for review"""
-        try:
-            query = self.client.table("message_flags").select("*").eq("reviewed", False)
-            if user_id:
-                # Join with messages to filter by user_id
-                query = self.client.table("message_flags").select(
-                    "*, messages(user_id)"
-                ).eq("messages.user_id", user_id)
-            response = query.order("flagged_at", desc=True).execute()
-            return response.data if response.data else []
-        except postgrest_exceptions.APIError as e:
-            print(f"Error fetching flagged messages: {e}")
             return []
 
     # ==================== UTILITY METHODS ====================
@@ -519,27 +320,18 @@ class SupabaseDB:
     def get_user_stats(self, user_id: str) -> Dict[str, Any]:
         """Get aggregated stats for a user"""
         try:
-            # Get message count
             messages = self.client.table("messages").select("id").eq("user_id", user_id).execute()
             message_count = len(messages.data) if messages.data else 0
 
-            # Get conversation count
             conversations = (
                 self.client.table("conversations").select("id").eq("user_id", user_id).execute()
             )
             conversation_count = len(conversations.data) if conversations.data else 0
 
-            # Get audit log count
-            audit_logs = (
-                self.client.table("audit_logs").select("id").eq("user_id", user_id).execute()
-            )
-            audit_count = len(audit_logs.data) if audit_logs.data else 0
-
             return {
                 "user_id": user_id,
                 "message_count": message_count,
                 "conversation_count": conversation_count,
-                "audit_count": audit_count,
             }
         except Exception as e:
             print(f"Error getting user stats: {e}")
