@@ -79,6 +79,30 @@ def _set_active_conversation(user_id: str, conversation_id: str) -> bool:
     session["conversation_id"] = conversation_id
     return True
 
+
+def _ensure_user_profile(user_id: str, email: str) -> None:
+    """Ensure auth user also exists in application users table.
+
+    Some test users may be created directly in Supabase Auth (without hitting /register),
+    so we upsert-like here to avoid downstream 500s when creating conversations.
+    """
+    if not user_id:
+        return
+
+    existing = db.get_user(user_id)
+    if existing:
+        return
+
+    try:
+        db.create_user(
+            user_id=user_id,
+            email=email or "",
+            metadata={"created_via": "login_auto_sync"},
+        )
+    except Exception as e:
+        # Re-raise so caller can surface meaningful auth/login failure.
+        raise Exception(f"Failed to sync user profile: {e}")
+
 # ===================================
 # Auth Routes
 # ===================================
