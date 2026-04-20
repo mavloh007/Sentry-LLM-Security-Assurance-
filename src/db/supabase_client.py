@@ -24,23 +24,77 @@ class SupabaseDB:
         self,
         supabase_url: Optional[str] = None,
         supabase_key: Optional[str] = None,
+        anon_key: Optional[str] = None,
     ):
         """
         Initialize Supabase client
-        
+
         Args:
             supabase_url: Supabase project URL (defaults to env var)
             supabase_key: Supabase service role key (defaults to env var)
+            anon_key: Supabase anon/public key used ONLY for transient auth
+                clients during login/signup (defaults to env var).
         """
         self.url = supabase_url or os.getenv("SUPABASE_URL")
         self.key = supabase_key or os.getenv("SUPABASE_SERVICE_KEY")
+        # Anon key is optional at construction time so CLI/ingest scripts that
+        # never call login/signup don't need it, but auth helpers below will
+        # raise if it's missing when they're actually used.
+        self.anon_key = anon_key or os.getenv("SUPABASE_ANON_KEY")
 
         if not self.url or not self.key:
             raise ValueError(
                 "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in .env or passed as arguments"
             )
 
+        # The shared client is authenticated with the SERVICE ROLE key and its
+        # auth header is never mutated after this point. All table reads/writes
+        # go through it and therefore bypass RLS as trusted backend traffic.
         self.client: Client = create_client(self.url, self.key)
+
+    # ==================== AUTH (TRANSIENT CLIENTS) ====================
+
+    def _build_anon_client(self) -> Client:
+        """Build a throwaway client using the anon key for auth-only calls.
+
+        The returned client is intended to be used for a single
+        sign_in_with_password / sign_up call and then discarded. Its JWT never
+        leaks onto ``self.client`` — this is what prevents the concurrent-login
+        race that causes RLS violations on the shared client.
+        """
+        if not self.anon_key:
+            raise ValueError(
+                "SUPABASE_ANON_KEY must be set in .env to use auth helpers"
+            )
+        return create_client(self.url, self.anon_key)
+
+    def verify_credentials(self, email: str, password: str) -> Tuple[str, str]:
+        """Verify an email/password pair against Supabase Auth.
+
+        Uses a TRANSIENT anon client so the shared service-role client's auth
+        header is never mutated. Returns ``(user_id, email)``.
+
+        Raises whatever ``supabase-py`` raises on invalid credentials so
+        callers can surface the auth error to the user.
+        """
+        tmp = self._build_anon_client()
+        response = tmp.auth.sign_in_with_password(
+            {"email": email, "password": password}
+        )
+        user = response.user
+        return user.id, (user.email or email)
+
+    def register_credentials(self, email: str, password: str) -> Tuple[str, str]:
+        """Register a new Supabase Auth user via a transient anon client.
+
+        Returns ``(user_id, email)``. Does NOT create the application-level
+        row in ``public.users``; callers should follow up with
+        :meth:`create_user` as they already do.
+        """
+        tmp = self._build_anon_client()
+        response = tmp.auth.sign_up({"email": email, "password": password})
+        user = response.user
+        return user.id, (user.email or email)
 
     # ==================== USER MANAGEMENT ====================
 

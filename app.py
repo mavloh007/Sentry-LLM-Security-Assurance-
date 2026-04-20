@@ -124,18 +124,15 @@ def register():
             return render_template('register.html', error='Password must be at least 6 characters')
 
         try:
-            # Sign up with Supabase Auth
-            response = db.client.auth.sign_up({
-                "email": email,
-                "password": password
-            })
-
-            user_id = response.user.id
+            # Sign up via a transient anon client so the shared service-role
+            # client's auth header is never mutated (prevents concurrent-login
+            # RLS races on the shared db.client).
+            user_id, verified_email = db.register_credentials(email, password)
 
             # Create user in our users table
             db.create_user(
                 user_id=user_id,
-                email=email,
+                email=verified_email,
                 metadata={"signup_method": "email", "created_at": str(uuid4())}
             )
 
@@ -165,17 +162,19 @@ def login():
             return render_template('login.html', error='Email and password required')
 
         try:
-            # Sign in with Supabase Auth
-            response = db.client.auth.sign_in_with_password({
-                "email": email,
-                "password": password
-            })
+            # Verify credentials via a transient anon client — the shared
+            # db.client (service role) is never touched, so concurrent logins
+            # don't race on its auth header.
+            user_id, verified_email = db.verify_credentials(email, password)
 
-            user_id = response.user.id
+            # Make sure there's a matching row in public.users. Test users
+            # provisioned directly in Supabase Auth may not have one, which
+            # would surface later as a FK violation on conversation inserts.
+            _ensure_user_profile(user_id, verified_email)
 
             # Store in session
             session['user_id'] = user_id
-            session['email'] = email
+            session['email'] = verified_email
             session.permanent = True
 
             return redirect(url_for('chat'))
