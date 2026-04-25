@@ -239,6 +239,22 @@
             border-bottom-left-radius: 4px;
         }
 
+        .message.assistant .message-content ul,
+        .message.assistant .message-content ol {
+            padding-left: 1.25rem;
+            margin: 0.4rem 0;
+        }
+        .message.assistant .message-content li { margin: 0.2rem 0; }
+        .message.assistant .message-content p:not(:last-child) { margin-bottom: 0.5rem; }
+        .message.assistant .message-content strong { font-weight: 700; }
+        .message.assistant .message-content code {
+            background: #f1f5f9;
+            padding: 1px 5px;
+            border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 0.9em;
+        }
+
         .message.error .message-content {
             background: #ffebee;
             color: #d32f2f;
@@ -382,7 +398,9 @@
             </div>
         </div>
     </div>
-
+    <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js">
+    </script>
     <script src="{{ url_for('static', filename='script.js') }}"></script>
 </body>
 </html>

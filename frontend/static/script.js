@@ -264,8 +264,13 @@ function addMessage(text, sender) {
 
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
-    contentDiv.textContent = text;
-
+     if (sender === 'assistant' && window.marked && window.DOMPurify) {
+        const html = window.marked.parse(text || '', { breaks: true });
+        contentDiv.innerHTML = window.DOMPurify.sanitize(html);
+    } else {
+        // user + error messages stay as plain text — never trust user input as HTML
+        contentDiv.textContent = text;
+    }
     messageDiv.appendChild(contentDiv);
     messagesContainer.appendChild(messageDiv);
 }
